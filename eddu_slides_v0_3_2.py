@@ -10,6 +10,7 @@ import logging
 import sys
 import threading
 import subprocess
+import time
 from pathlib import Path # pylint: disable=W0611
 try:
     import tkinter as tk
@@ -34,7 +35,13 @@ except ImportError:
     subprocess.check_call(['sudo', 'apt', 'install', '-y', 'python3-numpy'])
     os.execv(sys.executable, ['python3'] + sys.argv)  # Reinicia el script
     import numpy as np
-from PIL import Image as Imge
+try:
+    from PIL import Image as Imge
+except ImportError:
+    print("Pillow (PIL) no está instalado. Instalando...")
+    subprocess.check_call(['sudo', 'apt', 'install', '-y', 'python3-pil'])
+    os.execv(sys.executable, ['python3'] + sys.argv)
+    from PIL import Image as Imge
 
 try:
     from kivy.app import App
@@ -85,6 +92,25 @@ PREFIJO_ARCHIVO = "UY-UDELAR-AGU-"
 # Constantes para mensajes
 MENSAJE_PIDO_ROLLO = ("Es necesario saber el número de rollo con el que va a trabajar \n"
     "y la cantidad de dígitos.")
+MENSAJE_PIDO_QTY_CAMARAS = "Cuantas cámaras va a utilizar?"
+
+
+def desmontar_camara_gphoto2():
+    '''Desmonta cámaras montadas por gphoto2/FUSE/GVFS.'''
+    gvfs_base = f"/run/user/{os.getuid()}/gvfs"
+    encontrado = False
+    if os.path.exists(gvfs_base):
+        for entry in os.listdir(gvfs_base):
+            if "gphoto2:" in entry:
+                mount_path = os.path.join(gvfs_base, entry)
+                print(f"Desmontando cámara gphoto2 en: {mount_path}")
+                try:
+                    subprocess.run(['gio', 'mount', '-u', mount_path], check=True)
+                    encontrado = True
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    print(f"Error al desmontar {mount_path}: {e}")
+    if not encontrado:
+        print("No se encontró cámara gphoto2 montada.")
 
 @staticmethod
 def ingresar_nombre_archivo():
@@ -200,6 +226,8 @@ TITULO = NOMBRE_ARCHIVO
 CAMARA_2='c0424154da82472289e0caaf837f612b'
 CAMARA_1='00000000000000000000000008841539'
 
+desmontar_camara_gphoto2()
+
 class CustomFileChooserListView(FileChooserListView):
     '''
     Clase para deshabilitar scroll en el FileChooserListView y permitir seleccionar solo carpetas.
@@ -249,19 +277,24 @@ class CamApp(App):
         super().__init__(**kwargs)
 
         self.color_botones = (1, 0, 0, 0.5)  # Color original (rojo traslúcido)
+        self.color_boton_foco = (0.2, 0.75, 0.3, 0.95)
         self.numero_de_rollo =  StringProperty(' ')
+        self.cantidad_digitos = 4
         self.camara_previ = '0'
+        self.cantidad_camaras = 2
         self.lview = False
         self.img1 = Image(source='fb.png', size=(1024,768))
         self.title = TITULO
 
         self.estado_actual = self.directorio_app
+        self.label_item = ''
         self.numero_de_rollo_anterior = ''
         self.operacion_en_curso = False
         self.imagen_espejada = False
         self.timer = ''
         self.path_label = ''
         self.popup = ''
+        self.popup_qty_camaras = ''
         self.error_label = ''
         self.textinput = ''
         self.camera_01 = ''
@@ -271,6 +304,7 @@ class CamApp(App):
         self.camera_izq = ''
         self.cartel_rollo = ''
         self.muestro_nro_rollo = ''
+        self.box2 = ''
         self.btn0 = ''
         self.btn1 = ''
         self.btn2 = ''
@@ -280,8 +314,16 @@ class CamApp(App):
         self.btn_diapo = ''
         self.btn_apertura = ''
         self.btn_caratula = ''
+        self.btn_rotar_diapo = ''
         self.textinput_digitos = ''
         self.btn_abrir_carpeta = ''
+        self._yn_focus = 0
+        self._yn_buttons = ()
+        self._yn_callbacks = ()
+        self._yn_normal_colors = ()
+        self._popup_keyboard_mode = None
+        self._eligiendo_directorio = False
+
 
     def build(self):
         '''Crea la applicacion'''
@@ -300,14 +342,23 @@ class CamApp(App):
 
         self.estado_actual = Button(
             text=f"Directorio: {self.directorio_app}",
-            size_hint=(None, 0.04),
+            size_hint=(1, 0.04),
             pos_hint={'center_x':0.5},
             background_color=(0.1, 0.1, 0.1, 0.2)
         )
         layout.add_widget(self.estado_actual)
 
+        self.label_item = Label(
+            text="# Item: ",
+            size_hint=(1, 0.04),
+            pos_hint={'center_x': 0.5},
+            halign='center',
+            valign='middle'
+        )
+        self.label_item.bind(size=self.label_item.setter('text_size'))  # pylint: disable=no-member
+        layout.add_widget(self.label_item)
+
         layout.add_widget(self.img1, 0)
-        self.asignar_camaras()
 
         #Interfaz kivi
         bottom_layout = BoxLayout(
@@ -319,14 +370,14 @@ class CamApp(App):
         # Crear un AnchorLayout para centrar el GridLayout (box2) horizontalmente
         anchor_layout = AnchorLayout(anchor_x='center', anchor_y='bottom', size_hint=(1, 1))
 
-        box2 = GridLayout(
+        self.box2 = GridLayout(
             cols = 11,
             col_default_width=20,
             row_default_height=80,
             size_hint=(None, None)
         )
         # pylint: disable=no-member
-        box2.bind(minimum_size=box2.setter('size'))
+        self.box2.bind(minimum_size=self.box2.setter('size'))
 
         self.muestro_nro_rollo  = Label(
             text=MENSAJE_PIDO_ROLLO,
@@ -427,23 +478,22 @@ class CamApp(App):
         self.btn2.bind(on_press=self.btn_exit_callback)
         self.btn_rollo.bind(on_press=self.aumentar_1_nro_rollo)
         self.btn_rotar_diapo.bind(on_press=self.rotar_diapo)
-
         self.btn_directorio.bind(on_press=self.cambiar_directorio)
+        self.btn_abrir_carpeta.bind(on_press=self.abrir_carpeta)
 
-        box2.add_widget(self.btn_diapo)
-        box2.add_widget(self.btn_caratula)
-        box2.add_widget(self.btn_apertura)
+        self.box2.add_widget(self.btn_diapo)
+        self.box2.add_widget(self.btn_caratula)
+        self.box2.add_widget(self.btn_apertura)
+        self.box2.add_widget(self.btn_ndiapo)
+        self.box2.add_widget(self.btn0)
+        self.box2.add_widget(self.btn1)
+        self.box2.add_widget(self.btn_directorio)
+        self.box2.add_widget(self.btn_rollo)
+        self.box2.add_widget(self.btn_abrir_carpeta)
+        self.box2.add_widget(self.btn_rotar_diapo)
+        self.box2.add_widget(self.btn2)  # Salir siempre al final
 
-        box2.add_widget(self.btn_ndiapo)
-        box2.add_widget(self.btn0)
-        box2.add_widget(self.btn1)
-        box2.add_widget(self.btn2)
-        box2.add_widget(self.btn_directorio)
-        box2.add_widget(self.btn_rollo)
-        box2.add_widget(self.btn_abrir_carpeta)
-        box2.add_widget(self.btn_rotar_diapo)
-
-        anchor_layout.add_widget(box2)
+        anchor_layout.add_widget(self.box2)
         bottom_layout.add_widget(anchor_layout)
         layout.add_widget(bottom_layout)
         # layout.add_widget(box2,0)
@@ -452,86 +502,167 @@ class CamApp(App):
 
         return layout
 
+    def _choice_to_str(self, choice):
+        '''Normaliza choices de gphoto2 (str o [índice, label]).'''
+        if isinstance(choice, (list, tuple)):
+            for part in reversed(choice):
+                if isinstance(part, str):
+                    return part
+            return str(choice[-1]) if choice else ''
+        return str(choice)
+
+    def _configurar_capturetarget_ram(self, camera):
+        '''
+        Fuerza captura a RAM interna (sin tarjeta SD).
+        En locale ES: "RAM Interna"; en EN: "Internal RAM".
+        '''
+        try:
+            config = camera.get_config()
+            # pylint: disable=no-member
+            ok, widget = gp.gp_widget_get_child_by_name(config, 'capturetarget')
+            if ok < gp.GP_OK:  # pylint: disable=no-member
+                print("No se encontró el parámetro capturetarget")
+                return False
+
+            count = gp.gp_widget_count_choices(widget)  # pylint: disable=no-member
+            elegido = None
+            for i in range(count):
+                choice_raw = gp.gp_widget_get_choice(widget, i)  # pylint: disable=no-member
+                choice = self._choice_to_str(choice_raw)
+                print(f"capturetarget[{i}]: {choice_raw} -> {choice}")
+                choice_l = choice.lower()
+                if (
+                    'ram' in choice_l
+                    or 'interna' in choice_l
+                    or 'internal' in choice_l
+                ) and 'card' not in choice_l and 'tarjeta' not in choice_l:
+                    elegido = choice
+                    break
+
+            if elegido is None and count > 0:
+                elegido = self._choice_to_str(gp.gp_widget_get_choice(widget, 0))  # pylint: disable=no-member
+                print(f"Usando choice[0] por defecto: {elegido}")
+
+            if not elegido:
+                print("No hay choices para capturetarget")
+                return False
+
+            try:
+                widget.set_value(elegido)
+            except Exception:  # pylint: disable=broad-exception-caught
+                gp.gp_widget_set_value(widget, elegido)  # pylint: disable=no-member
+
+            camera.set_config(config)
+            actual = widget.get_value()
+            print(f"capturetarget configurado: {actual}")
+            return True
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            print(f"Error configurando capturetarget: {e}")
+            return False
+
     def asignar_camaras(self):
-        """Asignar las cámaras disponibles basadas en los seriales."""
-        asignacion_ok = True
-        print("Comenzando asignación de cámaras")
-        
+        """Asignar las cámaras disponibles basadas en los seriales y cantidad_camaras."""
+        print(f"Comenzando asignación de cámaras (modo {self.cantidad_camaras})")
+
         try:
             # Liberar cualquier cámara previamente asignada
             for attr in ['camera', 'camera_01', 'camara']:
                 if hasattr(self, attr) and getattr(self, attr):
-                    getattr(self, attr).exit()
+                    try:
+                        getattr(self, attr).exit()
+                    except Exception as e:  # pylint: disable=broad-exception-caught
+                        print(f"Error liberando {attr}: {e}")
                     setattr(self, attr, None)
 
-            # Obtener lista de cámaras (método compatible)
-            context = gp.Context()
             camera_list = []
-            
+
             try:
-                # Método moderno (nuevas versiones de gphoto2)
-                for name, addr in gp.Camera.autodetect(context):
-                    camera_list.append((name, addr))
-            except AttributeError:
-                # Método alternativo para versiones antiguas
-                port_info_list = gp.PortInfoList()
-                port_info_list.load()
-                abilities_list = gp.CameraAbilitiesList()
-                abilities_list.load(context)
-                for name, addr in abilities_list.detect(port_info_list, context):
-                    camera_list.append((name, addr))
+                # Misma forma que book-scan: autodetect() sin Context evita lista vacía
+                # con bindings nuevos de python-gphoto2.
+                camera_list = list(gp.Camera.autodetect())
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print(f"autodetect() falló ({e}), intentando método alternativo...")
+                try:
+                    context = gp.Context()
+                    port_info_list = gp.PortInfoList()
+                    port_info_list.load()
+                    abilities_list = gp.CameraAbilitiesList()
+                    abilities_list.load(context)
+                    for name, addr in abilities_list.detect(port_info_list, context):
+                        camera_list.append((name, addr))
+                except Exception as e2:  # pylint: disable=broad-exception-caught
+                    print(f"Método alternativo de detección falló: {e2}")
 
             if not camera_list:
                 print("No se detectaron cámaras conectadas")
                 return False
 
-            camera_list.sort(key=lambda x: x[0])  # Ordenar por nombre
+            camera_list.sort(key=lambda x: x[0])
 
             port_info_list = gp.PortInfoList()
             port_info_list.load()
 
             for name, addr in camera_list:
                 print(f"Detectada cámara: {name} en {addr}")
-                
+                camara = None
                 try:
                     camara = gp.Camera()
                     idx = port_info_list.lookup_path(addr)
                     camara.set_port_info(port_info_list[idx])
-                    
-                    print("Inicializando cámara...")
-                    camara.init(context)
-                    config_camara = camara.get_config(context)
-                    
-                    # Obtener número de serie
-                    serialnumber_config = config_camara.get_child_by_name('serialnumber')
-                    if serialnumber_config:
-                        raw_value = serialnumber_config.get_value()
-                        print(f"Serial detectado: {raw_value}")
 
-                        # Asignar cámaras según el serial
-                        if raw_value == CAMARA_1:
+                    print("Inicializando cámara...")
+                    camara.init()
+                    config_camara = camara.get_config()
+
+                    # Búsqueda recursiva del widget (igual que book-scan).
+                    # get_child_by_name() solo mira hijos directos y falla en Canon.
+                    # pylint: disable=no-member
+                    gp_ok, serialnumber_config = gp.gp_widget_get_child_by_name(
+                        config_camara,
+                        'serialnumber'
+                    )
+                    if gp_ok < gp.GP_OK:  # pylint: disable=no-member
+                        print(f"No se pudo obtener el número de serie para la cámara {name}.")
+                        camara.exit()
+                        continue
+
+                    raw_value = serialnumber_config.get_value()
+                    print(f"Serial detectado: {raw_value}")
+
+                    if raw_value == CAMARA_2:
+                        self._configurar_capturetarget_ram(camara)
+                        self.camera_01 = camara
+                        print(f"Asignada cámara diapo (serial: {raw_value})")
+                    elif raw_value == CAMARA_1:
+                        if self.cantidad_camaras == 2:
+                            self._configurar_capturetarget_ram(camara)
                             self.camera = camara
-                            print(f"Asignada cámara 1 (serial: {raw_value})")
-                        elif raw_value == CAMARA_2:
-                            self.camera_01 = camara
-                            print(f"Asignada cámara 2 (serial: {raw_value})")
+                            print(f"Asignada cámara marco (serial: {raw_value})")
                         else:
-                            print(f"Serial no reconocido: {raw_value}")
-                            camara.exit(context)
-                            asignacion_ok = False
+                            print("Cámara marco detectada pero no requerida en modo 1; se libera")
+                            camara.exit()
                     else:
-                        print("No se pudo obtener el número de serie")
-                        camara.exit(context)
-                        asignacion_ok = False
-                        
+                        print(f"Serial no reconocido: {raw_value}")
+                        camara.exit()
+
                 except gp.GPhoto2Error as e:
                     print(f"Error al inicializar cámara {name}: {e}")
-                    if 'camara' in locals():
-                        camara.exit(context)
-                    asignacion_ok = False
+                    if camara:
+                        try:
+                            camara.exit()
+                        except Exception:  # pylint: disable=broad-exception-caught
+                            pass
 
-            return asignacion_ok
-        except Exception as e:
+            if not self.camera_01:
+                print("No se asignó la cámara de diapo")
+                return False
+            if self.cantidad_camaras == 2 and not self.camera:
+                print("No se asignó la cámara de marco")
+                return False
+
+            print("Cámaras asignadas correctamente.")
+            return True
+        except Exception as e:  # pylint: disable=broad-exception-caught
             print(f"Error inesperado: {str(e)}")
             return False
 
@@ -541,17 +672,20 @@ class CamApp(App):
 
         if args[3] == 'm': # Salir
             self.btn_exit_callback()
-        elif args[3] == 'z': # Diapo
+        elif args[3] == 'z': # Diapo / Capturar
             self.btn0_callback_camera_01(self,'diapo')
         elif args[3] == 'x': # Anverso
-            self.btn0_callback(self,'anverso')
+            if self.cantidad_camaras == 2:
+                self.btn0_callback(self,'anverso')
         elif args[3] == 'c': # Reverso
-            self.btn0_callback(self,'reverso')
+            if self.cantidad_camaras == 2:
+                self.btn0_callback(self,'reverso')
         elif args[3] == 'v': # Item Numero
             self.pido_rollo()
         elif args[3]=='b': # Prev Marco
-            self.arranca_callback(self,'0')
-        elif args[3]=='n': # Prev Diapo
+            if self.cantidad_camaras == 2:
+                self.arranca_callback(self,'0')
+        elif args[3]=='n': # Prev Diapo / Prev Camara
             self.arranca_callback(self,'1')
         elif args[3]==',': # Cambiar Dir
             self.cambiar_directorio()
@@ -569,82 +703,148 @@ class CamApp(App):
         Window.clearcolor = (0.1, 0.1, 0.1, 0.2)
         Window.bind(on_request_close=self.btn_exit_callback)
 
-        Clock.schedule_once(lambda dt: self.pido_rollo(), 0.1)
-        # self.pido_rollo()
+        Clock.schedule_once(lambda dt: self.pido_qty_camaras(), 0.1)
         print ('arrancó')
 
+    def pido_qty_camaras(self):
+        '''Popup para seleccionar la cantidad de cámaras'''
+        layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
+
+        mensaje = Label(
+            text=MENSAJE_PIDO_QTY_CAMARAS,
+            size_hint=(1, 0.4)
+        )
+        layout.add_widget(mensaje)
+
+        botones = GridLayout(cols=2, spacing=10, size_hint=(1, 0.6))
+        btn_1_camara = Button(text="1 Cámara")
+        btn_2_camaras = Button(text="2 Cámaras")
+
+        botones.add_widget(btn_1_camara)
+        botones.add_widget(btn_2_camaras)
+        layout.add_widget(botones)
+
+        self.popup_qty_camaras = Popup(
+            title="Seleccionar cantidad de cámaras",
+            content=layout,
+            size_hint=(None, None),
+            size=(350, 250),
+            auto_dismiss=False
+        )
+
+        btn_1_camara.bind(on_release=self._set_cantidad_camaras_1)  # pylint: disable=no-member
+        btn_2_camaras.bind(on_release=self._set_cantidad_camaras_2)  # pylint: disable=no-member
+
+        self.popup_qty_camaras.open()
+
+    def _set_cantidad_camaras_1(self, *args):  # pylint: disable=unused-argument
+        self.cantidad_camaras = 1
+        self.popup_qty_camaras.dismiss()
+        if not self.asignar_camaras():
+            self.show_error_dialog(
+                "No se encontró la cámara de diapo.\nVerifique el serial y la conexión."
+            )
+            return
+        self._aplicar_ui_modo_camaras()
+        self.pido_rollo()
+
+    def _set_cantidad_camaras_2(self, *args):  # pylint: disable=unused-argument
+        self.cantidad_camaras = 2
+        self.popup_qty_camaras.dismiss()
+        if not self.asignar_camaras():
+            self.show_error_dialog(
+                "No se pudieron asignar ambas cámaras.\nVerifique los seriales y la conexión."
+            )
+            return
+        self._aplicar_ui_modo_camaras()
+        self.pido_rollo()
+
+    def _aplicar_ui_modo_camaras(self):
+        '''Ajusta textos y botones según cantidad de cámaras (sin toggle en caliente).'''
+        if self.cantidad_camaras == 1:
+            self.camara_previ = '1'
+            self.btn_diapo.text = "Capturar\n(z)"
+            self.btn1.text = "Prev Camara\n(n)"
+            self.btn_rotar_diapo.text = self._texto_btn_rotar(False)
+            for btn in (self.btn_caratula, self.btn_apertura, self.btn0):
+                if btn.parent:
+                    btn.parent.remove_widget(btn)
+        else:
+            self.camara_previ = '0'
+            self.btn_diapo.text = "Diapo\n(z)"
+            self.btn1.text = "Prev Diapo\n(n)"
+            self.btn_rotar_diapo.text = self._texto_btn_rotar(False)
+
+    def _texto_btn_rotar(self, activo=False):
+        base = "Rotar" if self.cantidad_camaras == 1 else "Rotar Diapo"
+        if activo:
+            return f"{base}\n(r)\n✓ ON"
+        return f"{base}\n(r)"
+
     def pido_rollo(self):
-        '''Ventana emergente para pedir el número de rollo'''
+        '''Ventana emergente para pedir el numero de rollo'''
         Window.unbind(on_key_down=self.key_action)
+        try:
+            Window.unbind(on_key_down=self._yes_no_key_action)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        try:
+            Window.unbind(on_keyboard=self._popup_on_keyboard)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
 
         path = self.directorio_app
-
-        ultimo_rollo = ""
         print('Data:', self.numero_de_rollo, path)
 
-        # Crear el layout del popup
-        self.cartel_rollo = GridLayout(cols = 1, rows = 7)
+        digitos_default = str(self.cantidad_digitos) if self.cantidad_digitos else '4'
+        numero_default = ''
+        try:
+            if str(self.numero_de_rollo).strip():
+                numero_default = str(int(self.numero_de_rollo))
+        except (TypeError, ValueError):
+            numero_default = ''
 
-        # Etiqueta para el mensaje
-        cartel = Label(
-            text=MENSAJE_PIDO_ROLLO,
-            valign='middle'
-        )
-
-        # Etiqueta para el mensaje de error
-        self.error_label = Label(text='', color=(1, 0, 0, 1)) # Rojo para el mensaje de error
-
-        #Botón para continuar
-        archivo_nuevo = Button(text = "Continuar")
-
-        # Agregar widgets al layout
+        self.cartel_rollo = GridLayout(cols=1, rows=7)
+        cartel = Label(text=MENSAJE_PIDO_ROLLO, valign='middle')
+        self.error_label = Label(text='', color=(1, 0, 0, 1))
+        archivo_nuevo = Button(text="Continuar")
         self.cartel_rollo.add_widget(cartel)
 
-        # Etiqueta "Cantidad de dígitos"
         label_digitos = Label(
-            text="Cantidad de dígitos",
+            text="Cantidad de digitos",
             size_hint_y=None,
             height=30,
             valign='middle'
         )
-
-        # Input para asignar entre 1 y 4
         self.textinput_digitos = TextInput(
-            text='4',
+            text=digitos_default,
             input_filter='int',
             multiline=False,
-            hint_text="Cantidad de dígitos"
+            hint_text="Cantidad de digitos"
         )
-
-        # Etiqueta "Número de rollo"
         label_num_rollo = Label(
-            text="Número de Rollo",
+            text="Numero de Rollo",
             size_hint_y=None,
             height=30,
             valign='middle'
         )
-
-         # Campo de entrada para el número de rollo
         self.textinput = TextInput(
-            text=(ultimo_rollo),
+            text=numero_default,
             unfocus_on_touch=False,
-            multiline = False,
+            multiline=False,
             input_filter='int',
-            hint_text="Número de Rollo",
+            hint_text="Numero de Rollo",
         )
 
-        # Agrega la etiqueta y el spinner al layout
         self.cartel_rollo.add_widget(label_digitos)
         self.cartel_rollo.add_widget(self.textinput_digitos)
         self.cartel_rollo.add_widget(label_num_rollo)
         self.cartel_rollo.add_widget(self.textinput)
         self.cartel_rollo.add_widget(self.error_label)
-
-        # Agregar el botón "Continuar"
         self.cartel_rollo.add_widget(archivo_nuevo)
 
         self.popup = Popup(
-            title='Ingrese Número de Rollo y Cantidad de Dígitos',
+            title='Ingrese Numero de Rollo y Cantidad de Digitos',
             content=self.cartel_rollo,
             size_hint=(None, None),
             size=(450, 400),
@@ -652,82 +852,103 @@ class CamApp(App):
         )
         self.popup.open()
 
-        # Función para poner el foco en el campo de texto
-        # pylint: disable=unused-argument
-        def focus_input(*args):
+        def focus_input(*args):  # pylint: disable=unused-argument
             self.textinput.focus = True
         Clock.schedule_once(focus_input, 0.1)
 
-        # Vincular el botón "Continuar" a la función de asignación del número de rollo
-        # pylint: disable=no-member
-        archivo_nuevo.bind(on_press=self.asignar_numero_rollo)
-
-        # Vincular Enter (on_text_validate) al mismo método del botón
-        # pylint: disable=no-member
-        self.textinput.bind(
-            on_text_validate=lambda instance: archivo_nuevo.trigger_action(duration=0.1)
+        archivo_nuevo.bind(on_press=self.asignar_numero_rollo)  # pylint: disable=no-member
+        self.textinput.bind(  # pylint: disable=no-member
+            on_text_validate=lambda instance: self.asignar_numero_rollo()
+        )
+        self.textinput_digitos.bind(  # pylint: disable=no-member
+            on_text_validate=lambda instance: self.asignar_numero_rollo()
         )
 
-        # Crea el directorio temporal
+        Window.bind(on_key_down=self._pido_rollo_key_action)
+        Window.bind(on_keyboard=self._popup_on_keyboard)
+        self._popup_keyboard_mode = 'pido_rollo'
         self.crear_directorio_temporal()
-        #return
 
-    def asignar_numero_rollo(self, *args): # pylint: disable=unused-argument
+    def _pido_rollo_key_action(self, *args):
+        '''Esc cierra Editar N item sin cambios.'''
+        key_str = self._keycode_name(*args)
+        print(f"pido_rollo key_down: {args[1:4]!r} -> {key_str!r}")
+        if key_str == 'escape' or (len(args) > 1 and args[1] == 27):
+            self._cancelar_pido_rollo()
+            return True
+        return False
+
+    def _cancelar_pido_rollo(self, *args):  # pylint: disable=unused-argument
+        '''Cierra el popup de item sin modificar el numero.'''
+        try:
+            Window.unbind(on_key_down=self._pido_rollo_key_action)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        try:
+            Window.unbind(on_keyboard=self._popup_on_keyboard)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        self._popup_keyboard_mode = None
+        if hasattr(self, 'popup') and self.popup and not isinstance(self.popup, str):
+            try:
+                self.popup.dismiss()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        Window.bind(on_key_down=self.key_action)
+
+    def _actualizar_ui_numero(self):
+        '''Actualiza botones/labels que muestran el numero de item.'''
+        nro = str(self.numero_de_rollo)
+        if hasattr(self, 'muestro_nro_rollo') and self.muestro_nro_rollo:
+            self.muestro_nro_rollo.text = nro
+        if hasattr(self, 'btn_rollo') and self.btn_rollo:
+            self.btn_rollo.text = "Ítem: " + nro + "\n(+)"
+        if hasattr(self, 'label_item') and self.label_item:
+            self.label_item.text = f"# Item: {nro}"
+
+    def asignar_numero_rollo(self, *args):  # pylint: disable=unused-argument
         '''Asigna el numero de rollo'''
         try:
+            try:
+                Window.unbind(on_key_down=self._pido_rollo_key_action)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            try:
+                Window.unbind(on_keyboard=self._popup_on_keyboard)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            self._popup_keyboard_mode = None
+
+            numero_txt = self.textinput.text.strip()
+            if not numero_txt:
+                self.error_label.text = "Por favor, ingrese el numero de rollo."
+                return
+
+            num_rollo = int(numero_txt)
+            cantidad_digitos_text = self.textinput_digitos.text.strip()
+            if not cantidad_digitos_text:
+                self.error_label.text = "Por favor, ingrese la cantidad de digitos."
+                return
+
+            cantidad_digitos = int(cantidad_digitos_text)
+            if cantidad_digitos < 1:
+                self.error_label.text = "La cantidad de digitos debe ser mayor a 0."
+                return
+
+            self.cantidad_digitos = cantidad_digitos
+            self.numero_de_rollo = f"{num_rollo:0{cantidad_digitos}d}"
+            print('Num Rollo', self.numero_de_rollo)
+            self._actualizar_ui_numero()
+
             Window.bind(on_key_down=self.key_action)
-            # Obtener el texto ingresado y quitar espacios extra
-            self.numero_de_rollo = self.textinput.text.strip()
-
-            # Verificar que el campo no esté vacío
-            if self.numero_de_rollo:
-                # Intentar convertir a entero para asegurar que es un número
-                num_rollo = int(self.numero_de_rollo)
-
-                cantidad_digitos_text = self.textinput_digitos.text.strip()
-                if cantidad_digitos_text:
-                    cantidad_digitos = int(cantidad_digitos_text)
-                else:
-                    self.error_label.text = "Por favor, ingrese la cantidad de dígitos."
-                    return
-
-                # Formatear con ceros a la izquierda
-                self.numero_de_rollo = f"{num_rollo:0{cantidad_digitos}d}"
-
-                # Formatear el número con ceros a la izquierda
-                #if num_rollo < 10:
-                #    num_rollo = '000' + str(num_rollo)
-                #elif num_rollo < 100:
-                #    num_rollo = '00' + str(num_rollo)
-                #elif num_rollo < 1000:
-                #    num_rollo = '0' + str(num_rollo)
-                #else:
-                #    num_rollo = str(num_rollo)
-
-                # Asignar el número de rollo formateado
-                #self.numero_de_rollo = num_rollo
-
-                # Actualizar la interfaz con el número de rollo
-                self.muestro_nro_rollo.text = self.numero_de_rollo
-                #self.muestro_nro_rollo.text = self.numero_de_rollo
-                print('Num Rollo',self.numero_de_rollo)
-                self.btn_rollo.text = "Ítem: " + self.numero_de_rollo + "\n(+)"
-
-                Window.bind(on_key_down=self.key_action)
-
-                # Cerrar el popup
-                self.popup.dismiss()
-
-                # Llamar al callback para continuar con el flujo
-                self.arranca_callback(self,'1')
-            else:
-                # Si el campo está vacío, mostrar mensaje de error
-                self.error_label.text = "Por favor, ingrese un número válido."
-                self.textinput.text = '' # Limpiar el campo texto
+            self.popup.dismiss()
+            self.arranca_callback(self, '1')
         except ValueError:
-            # Si el valor no se puede conovertir a número, mostrar mensaje de error
-            self.error_label.text = "Debe ingresar un número válido." # Mensaje de error
-            self.textinput.text = '' # Limpiar el campo texto
+            self.error_label.text = "Por favor, ingrese un numero valido."
+            print("Error: El valor ingresado no es un numero valido.")
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            self.error_label.text = "Ocurrio un error inesperado."
+            print(f"Error inesperado: {e}")
 
     def crear_directorio (self):
         '''Crea directorio si es necesario'''
@@ -787,220 +1008,404 @@ class CamApp(App):
         '''Camara Diapo'''
         self.capture_and_save_image(self.camera_01, args, 'camera_01')
 
+    def _detener_preview(self):
+        '''Corta el liveview de Kivy para no pelear con capture().'''
+        if getattr(self, 'timer', None):
+            try:
+                Clock.unschedule(self.timer)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            try:
+                Clock.unschedule(self.update)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            self.timer = None
+        self.lview = False
+        print("Preview detenido")
+
+    def _apagar_viewfinder(self, camera):
+        '''Apaga EVF/liveview en Canon antes de disparar.'''
+        for widget_name in ('eosviewfinder', 'viewfinder'):
+            try:
+                config = camera.get_config()
+                # pylint: disable=no-member
+                ok, widget = gp.gp_widget_get_child_by_name(config, widget_name)
+                if ok < gp.GP_OK:  # pylint: disable=no-member
+                    continue
+                try:
+                    widget.set_value(0)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    try:
+                        widget.set_value('0')
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        continue
+                camera.set_config(config)
+                print(f"Viewfinder apagado vía {widget_name}")
+                return True
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print(f"No se pudo apagar {widget_name}: {e}")
+        print("No se encontró widget de viewfinder; se continúa igual")
+        return False
+
+    def _drenar_eventos_camara(self, camera, timeout_ms=10):
+        '''Vacía la cola PTP hasta timeout (como thermal-scanner).'''
+        while True:
+            typ, _data = camera.wait_for_event(timeout_ms)
+            if typ == gp.GP_EVENT_TIMEOUT:  # pylint: disable=no-member
+                return
+
+    def _captura_fallida(self, mensaje):
+        print(f"Error en captura: {mensaje}")
+        self.operacion_en_curso = False
+        self.loading_cursor(False)
+        try:
+            self.mostrar_popup_error(str(mensaje))
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        preview = self.camara_previ if self.camara_previ in ('0', '1') else '1'
+        if self.cantidad_camaras == 1:
+            preview = '1'
+        self.arranca_callback(self, preview)
+
     def capture_and_save_image(self, camera, args, camera_type):
         '''Lógica común para capturar y guardar imagen de cualquier cámara'''
         if hasattr(self, 'operacion_en_curso') and self.operacion_en_curso:
             print("Otra operación está en curso. Espera a que termine.")
             return
+        if not camera:
+            print(f"Cámara {camera_type} no disponible")
+            return
+
         self.operacion_en_curso = True
+        self._detener_preview()
+        self.loading_cursor()
+        print(f'Camera {camera_type} Canon — preparando captura en hilo')
 
-        try:
-            # Cancelamos cualquier temporizador previo antes de realizar cualquier acción
-            if hasattr(self, 'timer') and self.timer:
-                Clock.unschedule(self.timer)
-                print("Temporizador cancelado")
+        etiqueta = args[1]
 
-            self.loading_cursor()
-            print(f'Camera {camera_type} Canon')
-
-            ## Desactivo el reloj
-            print(f"Timer {self.timer}")
-            self.timer = Clock.unschedule(self.update)
-
-            Clock.schedule_once(self._despues_de_esperar, 2)
-
-            ## Me traigo dónde dejará la captura
-            file_path = camera.capture(gp.GP_CAPTURE_IMAGE) # pylint: disable=no-member
-            print(f'Camera {camera_type} file path: {file_path.folder}/{file_path.name}')
-
-            # Nombre y destino de la imagen
-            nombre = NOMBRE_ARCHIVO + str(self.numero_de_rollo) + '-' + str(args[1]) + '.jpg'
-            target = os.path.join(self.directorio_app, nombre)
-            print('Copying image to', target)
-
-            # Verificación extra antes de comprobar existencia del archivo
-            if not os.path.isdir(self.directorio_app):
-                print(f"ERROR: El directorio '{self.directorio_app}' no existe.")
-                self.operacion_en_curso = False
-                return
-
-            # Guardar imagen temporal
-            camera_file = camera.file_get(
-                file_path.folder,
-                file_path.name,
-                gp.GP_FILE_TYPE_NORMAL # pylint: disable=no-member
-            )
-            target_temp = os.path.join(self.directorio_temporal, args[1] + '-' + file_path.name)
-            print("Guardando imagen temporal")
-
+        def trabajo_captura():
             try:
-                camera_file.save(target_temp)
-            except Exception as e: # pylint: disable=broad-exception-caught
-                self.operacion_en_curso = False
-                print(f"Error al guardar la imagen temporal Camera {camera_type}: {e}")
-                self.loading_cursor(False)
+                self._apagar_viewfinder(camera)
+                self._drenar_eventos_camara(camera)
+                # Por si la cámara volvió a "Tarjeta de memoria" (sin SD = hang).
+                self._configurar_capturetarget_ram(camera)
+                # Espera real: deja que la cámara salga de liveview.
+                time.sleep(0.5)
 
-            # Verificación de si el popup ya está abierto
-            if hasattr(self, 'popup') and self.popup.parent:
-                self.operacion_en_curso = False
-                return  # Si el popup ya está abierto, no permitir abrir otro
+                print(f'Disparando capture() en {camera_type}...')
+                file_path = camera.capture(gp.GP_CAPTURE_IMAGE)  # pylint: disable=no-member
+                print(f'Camera {camera_type} file path: {file_path.folder}/{file_path.name}')
 
-            def save_image():
-                self.loading_cursor()
-                print("Copying image to ", target)
+                if self.cantidad_camaras == 1:
+                    nombre = NOMBRE_ARCHIVO + str(self.numero_de_rollo) + '.jpg'
+                else:
+                    nombre = (
+                        NOMBRE_ARCHIVO +
+                        str(self.numero_de_rollo) +
+                        '-' +
+                        str(etiqueta) +
+                        '.jpg'
+                    )
+                target = os.path.join(self.directorio_app, nombre)
+                print('Copying image to', target)
+
+                if not os.path.isdir(self.directorio_app):
+                    Clock.schedule_once(
+                        lambda dt: self._captura_fallida(
+                            f"El directorio '{self.directorio_app}' no existe."
+                        ),
+                        0
+                    )
+                    return
+
                 camera_file = camera.file_get(
                     file_path.folder,
                     file_path.name,
-                    gp.GP_FILE_TYPE_NORMAL # pylint: disable=E1101
+                    gp.GP_FILE_TYPE_NORMAL  # pylint: disable=no-member
                 )
-                try:
-                    camera_file.save(target)
+                target_temp = os.path.join(
+                    self.directorio_temporal,
+                    str(etiqueta) + '-' + file_path.name
+                )
+                print("Guardando imagen temporal")
+                camera_file.save(target_temp)
 
-                    # *** NUEVO: Si es Diapo (camera_01) y espejado está activado, procesamos la imagen guardada ***
-                    if camera_type == 'camera_01' and self.imagen_espejada:
-                        # Cargar la imagen recién guardada
-                        img_pil = Imge.open(target)
-                        img_array = np.asarray(img_pil)
-                        
-                        # Aplicar flip horizontal
-                        img_array_flipped = np.fliplr(img_array)
-                        
-                        # Convertir de vuelta a PIL Image
-                        img_pil_flipped = Imge.fromarray(img_array_flipped.astype('uint8'))
-                        
-                        # Sobreescribir el archivo guardado con la versión espejada
-                        img_pil_flipped.save(target)
-                        print(f"Imagen espejada y guardada en {target}")
-                    else:
-                        print(f"Imagen guardada en {target}")
+                Clock.schedule_once(
+                    lambda dt: self._despues_de_captura(
+                        camera, args, camera_type, file_path, target, target_temp
+                    ),
+                    0
+                )
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                print(f"Error en hilo de captura: {e}")
+                Clock.schedule_once(lambda dt, err=e: self._captura_fallida(err), 0)
 
-                except Exception as e: # pylint: disable=broad-exception-caught
-                    self.operacion_en_curso = False
-                    print(f"Error al guardar la imagen Camera {camera_type}: {e}")
-                    self.loading_cursor(False)
+        threading.Thread(target=trabajo_captura, daemon=True).start()
 
-                try:
-                    camera.file_delete(file_path.folder, file_path.name)
-                except gp.GPhoto2Error as e:
-                    self.operacion_en_curso = False
-                    print(f"Error deleting file: {e}")
+    def _despues_de_captura(self, camera, args, camera_type, file_path, target, target_temp):
+        '''Continúa en el hilo de Kivy tras una captura exitosa.'''
+        if hasattr(self, 'popup') and self.popup and not isinstance(self.popup, str) and self.popup.parent:
+            self.operacion_en_curso = False
+            return
 
-                typ, data = camera.wait_for_event(200)
+        def save_image():
+            self.loading_cursor()
+            print("Copying image to ", target)
+            camera_file = camera.file_get(
+                file_path.folder,
+                file_path.name,
+                gp.GP_FILE_TYPE_NORMAL  # pylint: disable=E1101
+            )
+            try:
+                camera_file.save(target)
 
-                attempts = 10
-                while typ != gp.GP_EVENT_TIMEOUT and attempts > 0: # pylint: disable=no-member
-                    print("Event")
-                    if typ == gp.GP_EVENT_FILE_ADDED: # pylint: disable=no-member
-                        print(f'Camera: {camera_type} - file path: {data.folder}/{data.name}')
-                        if camera_type == "camera_01":
-                            raw_nombre = (
-                                NOMBRE_ARCHIVO +
-                                str(self.numero_de_rollo) +
-                                '-' +
-                                str(args[1]) +
-                                '.cr3'
-                            )
-                        else:
-                            raw_nombre = (
-                                NOMBRE_ARCHIVO +
-                                str(self.numero_de_rollo) +
-                                '-' +
-                                str(args[1])+'.nef'
-                            )
-                        raw_target = os.path.join(self.directorio_app, raw_nombre)
-                        print('Copying image to', raw_target)
-                        camera_file = camera.file_get(
-                            data.folder,
-                            data.name,
-                            gp.GP_FILE_TYPE_NORMAL # pylint: disable=no-member
+                if camera_type == 'camera_01' and self.imagen_espejada:
+                    img_pil = Imge.open(target)
+                    img_array = np.asarray(img_pil)
+                    img_array_flipped = np.fliplr(img_array)
+                    img_pil_flipped = Imge.fromarray(img_array_flipped.astype('uint8'))
+                    img_pil_flipped.save(target)
+                    print(f"Imagen espejada y guardada en {target}")
+                else:
+                    print(f"Imagen guardada en {target}")
+
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                self.operacion_en_curso = False
+                print(f"Error al guardar la imagen Camera {camera_type}: {e}")
+                self.loading_cursor(False)
+
+            try:
+                camera.file_delete(file_path.folder, file_path.name)
+            except gp.GPhoto2Error as e:
+                self.operacion_en_curso = False
+                print(f"Error deleting file: {e}")
+
+            typ, data = camera.wait_for_event(200)
+
+            attempts = 10
+            while typ != gp.GP_EVENT_TIMEOUT and attempts > 0:  # pylint: disable=no-member
+                print("Event")
+                if typ == gp.GP_EVENT_FILE_ADDED:  # pylint: disable=no-member
+                    print(f'Camera: {camera_type} - file path: {data.folder}/{data.name}')
+                    if self.cantidad_camaras == 1:
+                        raw_nombre = (
+                            NOMBRE_ARCHIVO +
+                            str(self.numero_de_rollo) +
+                            '.cr3'
                         )
-                        camera_file.save(raw_target)
+                    elif camera_type == "camera_01":
+                        raw_nombre = (
+                            NOMBRE_ARCHIVO +
+                            str(self.numero_de_rollo) +
+                            '-' +
+                            str(args[1]) +
+                            '.cr3'
+                        )
+                    else:
+                        raw_nombre = (
+                            NOMBRE_ARCHIVO +
+                            str(self.numero_de_rollo) +
+                            '-' +
+                            str(args[1]) + '.nef'
+                        )
+                    raw_target = os.path.join(self.directorio_app, raw_nombre)
+                    print('Copying image to', raw_target)
+                    camera_file = camera.file_get(
+                        data.folder,
+                        data.name,
+                        gp.GP_FILE_TYPE_NORMAL  # pylint: disable=no-member
+                    )
+                    camera_file.save(raw_target)
 
-                        if camera_type == 'camera_01':
+                    if camera_type == 'camera_01':
+                        if self.cantidad_camaras == 1:
+                            self.aumentar_1_nro_rollo()
+                            self.arranca_callback(self, '1')
+                        else:
                             self.arranca_callback(self, '0')
-                        elif camera_type == 'camera':
-                            self.mostrar_pregunta(self.manejar_respuesta)
+                    elif camera_type == 'camera':
+                        self.mostrar_pregunta(self.manejar_respuesta)
 
-                    typ, data = camera.wait_for_event(1)
-                    attempts -= 1
+                typ, data = camera.wait_for_event(1)
+                attempts -= 1
 
-            # Check if file already exists, then open a popup for confirmation
-            if os.path.isfile(target):
-                self._show_confirmation_popup(target, target_temp, save_image)
+        self._show_confirmation_popup(target, target_temp, save_image)
+
+
+    def _keycode_name(self, *args, key=None, codepoint=None):
+        '''Normaliza teclas de Kivy/SDL2 a nombres (escape, enter, down, ...).'''
+        if key is None and len(args) > 1:
+            key = args[1]
+        if codepoint is None and len(args) > 3:
+            codepoint = args[3]
+
+        if isinstance(key, (tuple, list)) and len(key) > 1:
+            return str(key[1]).lower()
+
+        if isinstance(key, int):
+            try:
+                from kivy.core.window import Keyboard
+                for name, code in Keyboard.keycodes.items():
+                    if code == key:
+                        return name
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            fallback = {
+                27: 'escape',
+                13: 'enter',
+                271: 'numpadenter',
+                273: 'up',
+                274: 'down',
+            }
+            if key in fallback:
+                return fallback[key]
+
+        if codepoint:
+            return str(codepoint).lower()
+        return ''
+
+    def _bind_yes_no_keys(self, btn_yes, btn_no, on_yes, on_no):
+        '''Teclado para popups Si/No: Enter confirma foco, flechas ciclan, Esc=No.'''
+        Window.unbind(on_key_down=self.key_action)
+        try:
+            Window.unbind(on_key_down=self._pido_rollo_key_action)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        try:
+            Window.unbind(on_key_down=self._yes_no_key_action)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        try:
+            Window.unbind(on_keyboard=self._popup_on_keyboard)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+        self._yn_focus = 0
+        self._yn_buttons = (btn_yes, btn_no)
+        self._yn_callbacks = (on_yes, on_no)
+        self._yn_normal_colors = (
+            tuple(btn_yes.background_color),
+            tuple(btn_no.background_color),
+        )
+        self._popup_keyboard_mode = 'yes_no'
+        self._update_yn_focus_visual()
+        Window.bind(on_key_down=self._yes_no_key_action)
+        # Esc en SDL2 llega por on_keyboard -> on_request_close; hay que interceptarlo.
+        Window.bind(on_keyboard=self._popup_on_keyboard)
+
+    def _unbind_yes_no_keys(self):
+        try:
+            Window.unbind(on_key_down=self._yes_no_key_action)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        try:
+            Window.unbind(on_keyboard=self._popup_on_keyboard)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        self._popup_keyboard_mode = None
+        Window.bind(on_key_down=self.key_action)
+
+    def _update_yn_focus_visual(self):
+        for i, btn in enumerate(self._yn_buttons):
+            if i == self._yn_focus:
+                btn.background_color = self.color_boton_foco
             else:
-                self._show_confirmation_popup(target, target_temp, save_image)
+                btn.background_color = (
+                    self._yn_normal_colors[i]
+                    if self._yn_normal_colors else self.color_botones
+                )
 
-        except gp.GPhoto2Error as e:
-            print(f"Error de GPhoto2: {e}")
-            self.operacion_en_curso = False
-        except FileNotFoundError as e:
-            print(f"Archivo no encontrado: {e}")
-            self.operacion_en_curso = False
-        except PermissionError as e:
-            print(f"Permiso denegado: {e}")
-            self.operacion_en_curso = False
-        except OSError as e:
-            print(f"Error del sistema operativo: {e}")
-            self.operacion_en_curso = False
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            print(f"Error inesperado: {e}")
-            self.operacion_en_curso = False
+    def _handle_yes_no_key(self, key_str):
+        if key_str in ('down', 'up'):
+            self._yn_focus = 1 - self._yn_focus
+            self._update_yn_focus_visual()
+            return True
+        if key_str in ('enter', 'numpadenter'):
+            self._unbind_yes_no_keys()
+            self._yn_callbacks[self._yn_focus]()
+            return True
+        if key_str == 'escape':
+            self._unbind_yes_no_keys()
+            self._yn_callbacks[1]()
+            return True
+        return False
+
+    def _yes_no_key_action(self, *args):
+        key_str = self._keycode_name(*args)
+        print(f"yes_no key_down: args={args[1:4]!r} -> {key_str!r}")
+        if self._handle_yes_no_key(key_str):
+            return True
+        return True
+
+    def _popup_on_keyboard(self, window, key, scancode=None, codepoint=None,
+                           modifier=None, **kwargs):  # pylint: disable=unused-argument
+        '''Intercepta teclas de popup; crítico para Esc (evita cerrar la app).'''
+        key_str = self._keycode_name(key=key, codepoint=codepoint)
+        print(f"popup on_keyboard: key={key!r} codepoint={codepoint!r} -> {key_str!r} mode={self._popup_keyboard_mode}")
+
+        if self._popup_keyboard_mode == 'yes_no':
+            if self._handle_yes_no_key(key_str):
+                return True
+            # Consumir Esc aunque no matchee, para no disparar on_request_close.
+            if key == 27 or key_str == 'escape':
+                self._unbind_yes_no_keys()
+                self._yn_callbacks[1]()
+                return True
+            return False
+
+        if self._popup_keyboard_mode == 'pido_rollo':
+            if key == 27 or key_str == 'escape':
+                self._cancelar_pido_rollo()
+                return True
+            return False
+
+        return False
 
     def _show_confirmation_popup(self, target, target_temp, save_image):
         self.loading_cursor(False)
 
-        # *** NUEVO: Cargar la imagen temporal y procesarla si es necesario ***
         try:
-            # Cargar la imagen desde el archivo temporal
             img_pil = Imge.open(target_temp)
             img_array = np.asarray(img_pil)
-            
-            # Si es Diapo (camera_01) y espejado está activado, hacer flip
             print(f"Camara Previ: {self.camara_previ}, Imagen Espejada: {self.imagen_espejada}")
             if self.camara_previ == '1' and self.imagen_espejada:
-                img_array = np.fliplr(img_array)  # Flip horizontal
-                
-            # Convertir el array numpy de vuelta a imagen PIL
+                img_array = np.fliplr(img_array)
             img_pil_processed = Imge.fromarray(img_array.astype('uint8'))
-            
-            # Guardar la imagen procesada temporalmente para mostrar en preview
             preview_temp = os.path.join(self.directorio_temporal, 'preview_temp.jpg')
             img_pil_processed.save(preview_temp)
-            
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             print(f"Error procesando imagen para preview: {e}")
-            preview_temp = target_temp  # Si hay error, usar la original
-        
-        # *** FIN DE LO NUEVO ***
+            preview_temp = target_temp
 
-        def on_confirm(instance=None): # pylint: disable=unused-argument
+        def on_confirm(instance=None):  # pylint: disable=unused-argument
+            self._unbind_yes_no_keys()
             self.loading_cursor()
             self.popup.dismiss()
             self.timer = Clock.schedule_interval(self.update, 1.0 / 24.0)
-            os.remove(target_temp)
-            # Limpiar el archivo de preview temporal si existe
+            if os.path.exists(target_temp):
+                os.remove(target_temp)
             if os.path.exists(preview_temp):
                 try:
                     os.remove(preview_temp)
-                except:
+                except Exception:  # pylint: disable=broad-exception-caught
                     pass
             save_image()
-            # threading.Thread(target=save_image).start()
             self.loading_cursor(False)
             self.operacion_en_curso = False
 
-        def on_cancel(instance=None): # pylint: disable=unused-argument
+        def on_cancel(instance=None):  # pylint: disable=unused-argument
+            self._unbind_yes_no_keys()
             self.loading_cursor(False)
             self.popup.dismiss()
             self.timer = Clock.schedule_interval(self.update, 1.0 / 24.0)
-            os.remove(target_temp)
-            # Limpiar el archivo de preview temporal si existe
+            if os.path.exists(target_temp):
+                os.remove(target_temp)
             if os.path.exists(preview_temp):
                 try:
                     os.remove(preview_temp)
-                except:
+                except Exception:  # pylint: disable=broad-exception-caught
                     pass
-            print("Operación cancelada por el usuario.")
+            print("Operacion cancelada por el usuario.")
             self.operacion_en_curso = False
             Clock.schedule_once(self._despues_de_esperar, 1)
 
@@ -1015,21 +1420,20 @@ class CamApp(App):
 
         btn_yes = Button(text="Sí", size_hint_y=None, height=40)
         btn_no = Button(text="No", size_hint_y=None, height=40)
-
-        btn_yes.bind(on_release=on_confirm) # pylint: disable=E1101
-        btn_no.bind(on_release=on_cancel) # pylint: disable=E1101
+        btn_yes.bind(on_release=on_confirm)  # pylint: disable=E1101
+        btn_no.bind(on_release=on_cancel)  # pylint: disable=E1101
 
         print(f"Target: {target}")
         print(f"Exite? {os.path.isfile(target)}")
         if os.path.isfile(target):
-            label_popup = (f"El archivo '{os.path.basename(target)}' " +
-                            "ya existe. ¿Desea sobreescribirlo?")
+            label_popup = (
+                f"El archivo '{os.path.basename(target)}' " +
+                "ya existe. ¿Desea sobreescribirlo?"
+            )
         else:
-            label_popup = "¿Desea guardar la imágen?"
+            label_popup = "¿Desea guardar la imagen?"
 
-        box.add_widget(Label(
-            text=label_popup
-        ))
+        box.add_widget(Label(text=label_popup))
         box.add_widget(img_preview)
         box.add_widget(btn_yes)
         box.add_widget(btn_no)
@@ -1042,15 +1446,41 @@ class CamApp(App):
             auto_dismiss=False
         )
         self.popup.open()
+        self._bind_yes_no_keys(btn_yes, btn_no, on_confirm, on_cancel)
 
-    def btn_exit_callback(self, *args): # pylint: disable=unused-argument
-        '''Salir del programa'''
+    def btn_exit_callback(self, *args, **kwargs):  # pylint: disable=unused-argument
+        '''Salir del programa liberando la sesión PTP sin reabrirla.'''
+        # Esc con popup abierto a veces llega acá vía on_request_close(source=keyboard).
+        if kwargs.get('source') == 'keyboard' and self._popup_keyboard_mode:
+            if self._popup_keyboard_mode == 'pido_rollo':
+                self._cancelar_pido_rollo()
+                return True
+            if self._popup_keyboard_mode == 'yes_no' and self._yn_callbacks:
+                self._unbind_yes_no_keys()
+                self._yn_callbacks[1]()
+                return True
+
+        if getattr(self, 'timer', None):
+            try:
+                Clock.unschedule(self.timer)
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+            self.timer = None
+
         self.eliminar_directorio_temporal()
-        self.camera.exit()
-        self.camera.init()
-        self.camera_01.exit()
-        self.camera_01.init()
+
+        for attr in ('camera', 'camera_01', 'camara'):
+            cam = getattr(self, attr, None)
+            if cam:
+                try:
+                    cam.exit()
+                    print(f"Cámara {attr} cerrada")
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    print(f"Error al cerrar {attr}: {e}")
+                setattr(self, attr, None)
+
         App.get_running_app().stop()
+        return True
 
     def _despues_de_esperar(self, dt): # pylint: disable=unused-argument
         # Código a ejecutar después de la espera de 2 segundos
@@ -1075,12 +1505,12 @@ class CamApp(App):
 
     def show_error_dialog(self, message):
         """Muestra un popup de error con un botón para cerrar la aplicación."""
-        if hasattr(self, 'popup') and self.popup.parent:
-            # Si el popup ya está abierto, no lo volvemos a mostrar
+        if hasattr(self, 'popup') and self.popup and not isinstance(self.popup, str) and self.popup.parent:
             print("El popup ya está abierto, no se abrirá nuevamente")
             self.popup.dismiss()
 
         def close_app(instance): # pylint: disable=unused-argument
+            App.get_running_app().stop()
             sys.exit()  # Cierra la aplicación cuando el usuario presiona "Cerrar"
 
         layout = BoxLayout(orientation='vertical', padding=10, spacing=10)
@@ -1096,7 +1526,7 @@ class CamApp(App):
         layout.add_widget(message_label)
         layout.add_widget(close_button)
 
-        popup = Popup(
+        self.popup = Popup(
             title="Error",
             content=layout,
             size_hint=(None, None),
@@ -1104,7 +1534,7 @@ class CamApp(App):
             auto_dismiss=False  # Evita que el usuario cierre el popup sin el botón
         )
 
-        popup.open()
+        self.popup.open()
 
     def update(self, *args): # pylint: disable=unused-argument
         '''Update'''
@@ -1146,14 +1576,12 @@ class CamApp(App):
             print("No se pudo capturar la vista previa.")
 
     def mostrar_pregunta(self, callback):
-        ''' Muestra un popup con una pregunta de Sí o No '''
-        # Esperamos 2 segundo antes de continuarr para dar tiempo a la cámara a terminar
-        print("Esperando 2 segundo para que la cáamara termina la operación anterior...")
+        ''' Muestra un popup con una pregunta de Si o No '''
+        print("Esperando 2 segundo para que la camara termina la operacion anterior...")
         Clock.schedule_once(self._despues_de_esperar, 2)
 
-        if hasattr(self, 'popup') and self.popup.parent:
-            # Si el popup ya está abierto, no lo volvemos a mostrar
-            print("El popup ya está abierto, no se abrirá nuevamente")
+        if hasattr(self, 'popup') and self.popup and not isinstance(self.popup, str) and self.popup.parent:
+            print("El popup ya esta abierto, no se abrira nuevamente")
             self.popup.dismiss()
 
         box = BoxLayout(orientation='vertical', padding=10, spacing=10)
@@ -1162,18 +1590,21 @@ class CamApp(App):
         botones = BoxLayout(orientation='horizontal', spacing=10)
         btn_si = Button(text="Sí")
         btn_no = Button(text="No")
-
         botones.add_widget(btn_si)
         botones.add_widget(btn_no)
-
         box.add_widget(label)
         box.add_widget(botones)
 
-        # Vincular botones a las funciones correspondientes
-        # pylint: disable=no-member
-        btn_si.bind(on_press=lambda instance: self._cerrar_popup(callback, True))
-        # pylint: disable=no-member
-        btn_no.bind(on_press=lambda instance: self._cerrar_popup(callback, False))
+        def on_yes(instance=None):  # pylint: disable=unused-argument
+            self._unbind_yes_no_keys()
+            self._cerrar_popup(callback, True)
+
+        def on_no(instance=None):  # pylint: disable=unused-argument
+            self._unbind_yes_no_keys()
+            self._cerrar_popup(callback, False)
+
+        btn_si.bind(on_press=on_yes)  # pylint: disable=no-member
+        btn_no.bind(on_press=on_no)  # pylint: disable=no-member
 
         self.popup = Popup(
             title="Finalizar proceso",
@@ -1183,20 +1614,27 @@ class CamApp(App):
             auto_dismiss=False
         )
         self.popup.open()
-
+        self._bind_yes_no_keys(btn_si, btn_no, on_yes, on_no)
         self.loading_cursor(False)
 
     def _cerrar_popup(self, callback, respuesta):
-        ''' Cierra el popup y llama a la función de callback con la respuesta '''
+        ''' Cierra el popup y llama a la funcion de callback con la respuesta '''
         Clock.schedule_once(lambda dt: self.popup.dismiss(), 0.1)
-        # Ensure the callback is invoked only after the popup is dismissed
         Clock.schedule_once(lambda dt: callback(respuesta), 0.2)
 
-    def aumentar_1_nro_rollo(self, *args): # pylint: disable=W0613
-        '''Función para aumentar en 1 el nro de rollo'''
-        self.textinput.text = str(int(self.numero_de_rollo) + 1)
-        print(f'Nuevo numero de rollo: {self.textinput.text}')
-        self.asignar_numero_rollo()
+    def aumentar_1_nro_rollo(self, *args):  # pylint: disable=W0613
+        '''Funcion para aumentar en 1 el nro de rollo'''
+        try:
+            digits = self.cantidad_digitos or len(str(self.numero_de_rollo))
+            if not digits:
+                digits = 4
+            num = int(self.numero_de_rollo) + 1
+            self.cantidad_digitos = digits
+            self.numero_de_rollo = f"{num:0{digits}d}"
+            print(f'Nuevo numero de rollo: {self.numero_de_rollo}')
+            self._actualizar_ui_numero()
+        except (TypeError, ValueError) as e:
+            print(f"No se pudo aumentar el numero de item: {e}")
 
     def abrir_carpeta(self, *args): # pylint: disable=W0613
         '''Función para abrir la carpeta desitno'''
@@ -1209,26 +1647,27 @@ class CamApp(App):
         '''Respuesta'''
         self.loading_cursor(True)
         if respuesta:
-            print("El usuario eligió Sí")
-            # Tengo que agarrar las 3 fotos y armar una sola
+            print("El usuario eligio Si")
             if not self.combinar_imagenes():
                 self.loading_cursor(False)
-                return # Si falta alguna imagen, no continuar
+                return
 
             self.cambio_de_diapo()
 
             self.numero_de_rollo_anterior = self.numero_de_rollo
-            self.textinput.text = str(int(self.numero_de_rollo) + 1)
-            print('# nuevo',self.numero_de_rollo)
-            self.asignar_numero_rollo()
+            digits = self.cantidad_digitos or 4
+            num = int(self.numero_de_rollo) + 1
+            self.numero_de_rollo = f"{num:0{digits}d}"
+            print('# nuevo', self.numero_de_rollo)
+            self._actualizar_ui_numero()
 
-            self.arranca_callback(self, '1')  # Llama a Prev Diapo
+            self.arranca_callback(self, '1')
             Clock.schedule_once(lambda dt: self.arranca_callback(self, '1'), 0.1)
             self.loading_cursor(False)
         else:
-            print("El usuario eligió No")
-            self.arranca_callback(self,'0') # Llama a Prev Marco
-            Clock.schedule_once(lambda dt: self.arranca_callback(self,'0'), 0.1)
+            print("El usuario eligio No")
+            self.arranca_callback(self, '0')
+            Clock.schedule_once(lambda dt: self.arranca_callback(self, '0'), 0.1)
             self.loading_cursor(False)
 
     def loading_cursor(self, wait = True):
@@ -1291,76 +1730,99 @@ class CamApp(App):
         '''Cierre popup'''
         self.popup.dismiss()
 
-    def cambiar_directorio(self, *args): # pylint: disable=unused-argument
-        '''Solucionar la selección'''
-        chooser = CustomFileChooserListView(dirselect=True)
+    def _asegurar_zenity(self):
+        '''Instala zenity si falta (diálogo nativo GTK compatible con Kivy).'''
+        if shutil.which('zenity'):
+            return True
+        print("zenity no está instalado. Instalando...")
+        try:
+            subprocess.check_call(['sudo', 'apt', 'install', '-y', 'zenity'])
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            print(f"No se pudo instalar zenity: {e}")
+            return False
+        return bool(shutil.which('zenity'))
 
-        # Establecer el directorio inicial
-        if self.directorio_app == '':
-            chooser.path = '/home/eddu/Documentos/Slides/Fotos/'  # Ruta inicial
-        else:
-            chooser.path = self.directorio_app
+    def _elegir_carpeta_nativa(self, initial_dir):
+        '''
+        Selector de carpeta nativo de Ubuntu.
+        Usa zenity (GTK): tkinter.askdirectory pelea el foco con la ventana SDL/Kivy
+        y el diálogo queda inutilizable (solo Esc cancela).
+        '''
+        initial_dir = initial_dir or os.path.expanduser("~/Documentos")
+        if not os.path.isdir(initial_dir):
+            initial_dir = os.path.expanduser("~")
 
-        # Crear un botón adicional dentro del Popup
-        btn_aceptar = Button(text="Aceptar", size_hint=(None, None), width=200)
-        # pylint: disable=no-member
-        btn_aceptar.bind(on_press=lambda *args: self.select_directory(chooser.selection))
+        if self._asegurar_zenity():
+            cmd = [
+                'zenity',
+                '--file-selection',
+                '--directory',
+                '--title=Seleccionar Carpeta',
+                f'--filename={initial_dir.rstrip("/")}/',
+            ]
+            print(f"Abriendo zenity: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                return result.stdout.strip()
+            if result.stderr:
+                print(f"zenity stderr: {result.stderr.strip()}")
+            return ''
 
-        # Crear un label para mostrar la ruta
-        self.path_label = Label(text='Ruta: ', size_hint_y=None, height=30)
+        # Fallback (puede fallar el foco con Kivy)
+        print("Fallback a tkinter.filedialog (puede fallar el foco con Kivy)")
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes('-topmost', True)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        carpeta = filedialog.askdirectory(
+            title="Seleccionar Carpeta",
+            initialdir=initial_dir
+        )
+        try:
+            root.destroy()
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+        return carpeta or ''
 
-        # Función para actualizar la ruta cuando el usuario seleccione un archivo o carpeta
-        def update_label(instance, value):
-            if value:
-                selected_path = value[0]
-                if os.path.isfile(selected_path):
-                    # Si es un archivo, obtener su carpeta
-                    selected_path = os.path.dirname(selected_path)
-                self.path_label.text = f"Ruta: {selected_path}"
-            else:
-                self.path_label.text = f'Ruta: {instance.path}'
+    def cambiar_directorio(self, *args):  # pylint: disable=unused-argument
+        '''Abre el dialogo nativo de Ubuntu para elegir carpeta.'''
+        if self._eligiendo_directorio:
+            print("Ya hay un diálogo de directorio abierto; se ignora reentrada.")
+            return
+        self._eligiendo_directorio = True
+        Window.unbind(on_key_down=self.key_action)
+        try:
+            carpeta = self._elegir_carpeta_nativa(self.directorio_app)
+        finally:
+            Window.bind(on_key_down=self.key_action)
+            self._eligiendo_directorio = False
 
+        if not carpeta:
+            print("No se selecciono ninguna carpeta.")
+            return
 
-        # Vincular la propiedad 'selection' del FileChooserIconView con la función update_label
-        chooser.bind(selection=update_label)
-
-        # Usar un ScrollView para permitir el desplazamiento solo cuando sea necesario
-        scroll = ScrollView(do_scroll_x=False, do_scroll_y=True)
-        scroll.add_widget(chooser)
-
-        # Layout para la parte inferior (botón y ruta)
-        box2 = BoxLayout(orientation='horizontal', size_hint_y=None, height=50)
-        box2.add_widget(self.path_label)
-        box2.add_widget(btn_aceptar)
-
-        # Layout del Popup (contendrá tanto el selector como el botón adicional)
-        popup_layout = BoxLayout(orientation='vertical')
-        popup_layout.add_widget(scroll) # El selector de directorios está dentro de un ScrollView
-        popup_layout.add_widget(box2) # El BoxLayout estará en la parte inferior
-
-        # Crear el popup
-        self.popup = Popup(title="Seleccionar Carpeta", content=popup_layout, size_hint=(0.8, 0.8))
-        self.popup.open()
-
-    def select_directory(self, selection):
-        '''Selecciona directorio'''
-        if not selection:
-            print("No se seleccionó ninguna carpeta.")
-            return  # Evita continuar si no hay selección
-
-        selected_path = selection[0]
-        if os.path.isfile(selected_path):
-            selected_path = os.path.dirname(selected_path)
-
-        if selected_path != self.directorio_app:
-            self.directorio_app = selected_path
-            self.estado_actual.text = f"Directorio: {selected_path}"
+        if carpeta != self.directorio_app:
+            self.directorio_app = carpeta
+            self.estado_actual.text = f"Directorio: {carpeta}"
             print(f"Carpeta seleccionada: {self.directorio_app}")
         else:
             print("La carpeta seleccionada es la misma.")
 
-        # Cerrar popup de manera segura
-        if hasattr(self, 'popup') and self.popup and self.popup.parent:
+    def select_directory(self, selection):
+        '''Compatibilidad: selecciona directorio desde lista.'''
+        if not selection:
+            print("No se selecciono ninguna carpeta.")
+            return
+        selected_path = selection[0]
+        if os.path.isfile(selected_path):
+            selected_path = os.path.dirname(selected_path)
+        if selected_path != self.directorio_app:
+            self.directorio_app = selected_path
+            self.estado_actual.text = f"Directorio: {selected_path}"
+            print(f"Carpeta seleccionada: {self.directorio_app}")
+        if hasattr(self, 'popup') and self.popup and not isinstance(self.popup, str) and getattr(self.popup, 'parent', None):
             self.popup.dismiss()
 
     def rotar_diapo(self, *args):
@@ -1374,12 +1836,10 @@ class CamApp(App):
         
         # Actualizar el texto del botón para mostrar el estado actual
         if self.imagen_espejada:
-            # Si está espejada, mostrar en verde o indicar que está activo
-            self.btn_rotar_diapo.text = "Rotar Diapo\n(r)\n✓ ON"
+            self.btn_rotar_diapo.text = self._texto_btn_rotar(True)
             self.btn_rotar_diapo.background_color = (0.2, 0.8, 0.2, 0.8)  # Verde
         else:
-            # Si no está espejada, mostrar el estado normal
-            self.btn_rotar_diapo.text = "Rotar Diapo\n(r)"
+            self.btn_rotar_diapo.text = self._texto_btn_rotar(False)
             self.btn_rotar_diapo.background_color = self.color_botones  # Color original (rojo)        
         print(f"Espejado: {self.imagen_espejada}")
 
