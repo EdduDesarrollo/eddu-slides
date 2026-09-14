@@ -1,0 +1,3 @@
+# Ignorar contenido de Fotos, pero conservar la carpeta
+Fotos/*
+!Fotos/.gitkeep
