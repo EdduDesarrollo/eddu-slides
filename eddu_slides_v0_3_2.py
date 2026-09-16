@@ -387,7 +387,7 @@ class CamApp(App):
 
         ## Digitalizar
         self.btn_diapo = Button(
-            text = "Diapo\n(z)",
+            text = "Diapo\n(w)",
             size_hint = (None,0.1),
             background_color = self.color_botones,
             halign="center",
@@ -672,7 +672,7 @@ class CamApp(App):
 
         if args[3] == 'm': # Salir
             self.btn_exit_callback()
-        elif args[3] == 'z': # Diapo / Capturar
+        elif args[3] == 'w': # Diapo / Capturar
             self.btn0_callback_camera_01(self,'diapo')
         elif args[3] == 'x': # Anverso
             if self.cantidad_camaras == 2:
@@ -763,7 +763,7 @@ class CamApp(App):
         '''Ajusta textos y botones según cantidad de cámaras (sin toggle en caliente).'''
         if self.cantidad_camaras == 1:
             self.camara_previ = '1'
-            self.btn_diapo.text = "Capturar\n(z)"
+            self.btn_diapo.text = "Capturar\n(w)"
             self.btn1.text = "Prev Camara\n(n)"
             self.btn_rotar_diapo.text = self._texto_btn_rotar(False)
             for btn in (self.btn_caratula, self.btn_apertura, self.btn0):
@@ -771,7 +771,7 @@ class CamApp(App):
                     btn.parent.remove_widget(btn)
         else:
             self.camara_previ = '0'
-            self.btn_diapo.text = "Diapo\n(z)"
+            self.btn_diapo.text = "Diapo\n(w)"
             self.btn1.text = "Prev Diapo\n(n)"
             self.btn_rotar_diapo.text = self._texto_btn_rotar(False)
 
